@@ -20,6 +20,9 @@
 //!
 //! - `gen_metadata.#1`            → chatModel message
 //!   - `#19` (string)            → responseModel (e.g. `gemini-3-flash-a`)
+//!   - `#20` (repeated `{#1: key, #2: value}` map entries) → `model_enum`
+//!     (`MODEL_PLACEHOLDER_M318`), the service-side identity of the model that
+//!     served the turn; sibling keys are `trajectory_id`, `last_step_index`, …
 //!   - `#9.#4` = `{#1: seconds, #2: nanos}` → per-generation wall-clock time
 //!   - `#4`                      → usage message
 //!     - `#1` (varint, const)    → fixed system-prompt tokens (≈1132)
@@ -369,12 +372,33 @@ fn parse_gen_metadata(
         }
     }
 
-    let model_raw = string_field(chat_model, 19)
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or("unknown");
-    let model_id = pricing::aliases::resolve_alias(model_raw)
-        .unwrap_or(model_raw)
-        .to_string();
+    // A responseModel *name* decides the identity whenever the row has one. The
+    // Antigravity service appends a route label to the underlying model's id
+    // (`gemini-3.8-flash-control`, `-high`, `-tiered`, …) and those labels are
+    // not models — they are different paths onto one model — so the label is
+    // folded away before the alias table is consulted. Without the fold, one
+    // model is reported as several rows in the model report.
+    //
+    // A row with no name still carries `#20`'s `model_enum`, which names the
+    // model the service actually served; a *known* enum is used, so those rows
+    // keep a real model identity instead of collapsing into `unknown`. An enum
+    // we have no mapping for is never guessed at: the row stays `unknown`,
+    // exactly as it did before.
+    let model_name = string_field(chat_model, 19).filter(|text| !text.trim().is_empty());
+    let model_enum =
+        map_string_field(chat_model, 20, "model_enum").filter(|text| !text.trim().is_empty());
+    let model_id = match model_name {
+        Some(name) => {
+            let name = pricing::aliases::fold_antigravity_route_label(name).unwrap_or(name);
+            pricing::aliases::resolve_alias(name)
+                .unwrap_or(name)
+                .to_string()
+        }
+        None => model_enum
+            .and_then(pricing::aliases::resolve_alias)
+            .unwrap_or("unknown")
+            .to_string(),
+    };
     // Antigravity CLI is a subscription *channel*: usage is billed against
     // Google's official price list, so the hint names the channel rather than
     // the model vendor — `pricing/lookup.rs::prefer_litellm_over_openrouter`
@@ -675,6 +699,30 @@ fn string_field(buf: &[u8], field: u64) -> Option<&str> {
     message_field(buf, field).and_then(|bytes| std::str::from_utf8(bytes).ok())
 }
 
+/// Value of one key in a repeated protobuf map field.
+///
+/// `chatModel.#20` is a list of `{#1: key, #2: value}` entries (`model_enum`,
+/// `trajectory_id`, `last_step_index`, …), so [`message_field`] — which returns
+/// the *first* entry of a field — would answer with whichever key the service
+/// wrote first. Scan every entry and match on the key instead.
+fn map_string_field<'a>(buf: &'a [u8], field: u64, key: &str) -> Option<&'a str> {
+    let mut reader = ProtoReader::new(buf);
+    while let Some((found, wire)) = reader.next_field() {
+        if found != field {
+            continue;
+        }
+        let Wire::Len(entry) = wire else {
+            continue;
+        };
+        if string_field(entry, 1) == Some(key) {
+            if let Some(value) = string_field(entry, 2) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +770,27 @@ mod tests {
         response_id: Option<&[u8]>,
         native_ts: Option<(u64, u64)>,
     ) -> Vec<u8> {
+        build_gen_metadata_full_with(Some(model), response_id, native_ts, None)
+    }
+
+    /// `model`/`model_enum` are written as `chatModel.#19` and, when present,
+    /// as the `model_enum` entry of the `#20` map — preceded by a decoy
+    /// `last_step_index` entry so a first-match reader would return the wrong
+    /// value (the real databases always carry several `#20` entries).
+    fn build_gen_metadata_with_model_and_enum(
+        model: Option<&str>,
+        model_enum: Option<&str>,
+    ) -> Vec<u8> {
+        build_gen_metadata_full_with(model, Some(b"resp-1"), None, model_enum)
+    }
+
+    fn build_gen_metadata_full_with(
+        model: Option<&str>,
+        response_id: Option<&[u8]>,
+        native_ts: Option<(u64, u64)>,
+        model_enum: Option<&str>,
+    ) -> Vec<u8> {
+        // usage message (#4 of chatModel)
         let mut usage = Vec::new();
         usage.extend(enc_varint(1, 1132)); // fixed system prompt
         usage.extend(enc_varint(2, 500)); // new input
@@ -741,7 +810,20 @@ mod tests {
             let gen9 = enc_len(4, &gen_time);
             chat_model.extend(enc_len(9, &gen9));
         }
-        chat_model.extend(enc_len(19, model.as_bytes()));
+        if let Some(model) = model {
+            chat_model.extend(enc_len(19, model.as_bytes()));
+        }
+        if let Some(model_enum) = model_enum {
+            let mut decoy = Vec::new();
+            decoy.extend(enc_len(1, b"last_step_index"));
+            decoy.extend(enc_len(2, b"0"));
+            chat_model.extend(enc_len(20, &decoy));
+
+            let mut entry = Vec::new();
+            entry.extend(enc_len(1, b"model_enum"));
+            entry.extend(enc_len(2, model_enum.as_bytes()));
+            chat_model.extend(enc_len(20, &entry));
+        }
 
         enc_len(1, &chat_model)
     }
@@ -1808,5 +1890,110 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].timestamp, 1_781_502_653_000);
         assert_standard_message_fields(&messages[0], Some("resp-1"));
+    }
+
+    #[test]
+    fn folds_flash_route_labels_onto_the_base_model() {
+        let cases = [
+            (
+                "gemini-3.8-flash",
+                Some("MODEL_PLACEHOLDER_M318"),
+                "gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.8-flash-control",
+                Some("MODEL_PLACEHOLDER_M318"),
+                "gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.8-flash-high",
+                Some("MODEL_PLACEHOLDER_M318"),
+                "gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.8-flash-tiered",
+                Some("MODEL_PLACEHOLDER_M322"),
+                "gemini-3.8-flash",
+            ),
+            (
+                "gemini-3.8-flash-some-future-label",
+                None,
+                "gemini-3.8-flash",
+            ),
+        ];
+
+        for (name, model_enum, expected) in cases {
+            let blob = build_gen_metadata_with_model_and_enum(Some(name), model_enum);
+            let mut seen = HashSet::new();
+            let msg = parse_gen_metadata_default(&blob, "s", 1_000, &HashMap::new(), &mut seen)
+                .expect("parses");
+            assert_eq!(msg.model_id, expected, "name: {name}, enum: {model_enum:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_a_different_model_family_apart() {
+        let cases = [
+            ("gemini-3.8-live", None, "gemini-3.8-live"),
+            (
+                "gemini-3.8-live-extended-thinking",
+                None,
+                "gemini-3.8-live-extended-thinking",
+            ),
+            (
+                "gemini-3.8-live",
+                Some("MODEL_PLACEHOLDER_M999"),
+                "gemini-3.8-live",
+            ),
+        ];
+
+        for (name, model_enum, expected) in cases {
+            let blob = build_gen_metadata_with_model_and_enum(Some(name), model_enum);
+            let mut seen = HashSet::new();
+            let msg = parse_gen_metadata_default(&blob, "s", 1_000, &HashMap::new(), &mut seen)
+                .expect("parses");
+            assert_eq!(msg.model_id, expected, "name: {name}, enum: {model_enum:?}");
+        }
+    }
+
+    #[test]
+    fn model_enum_identifies_a_row_that_has_no_response_model() {
+        let cases = [
+            (None, Some("MODEL_PLACEHOLDER_M318"), "gemini-3.8-flash"),
+            (None, Some("MODEL_PLACEHOLDER_M35"), "claude-sonnet-4-6"),
+            (None, Some("MODEL_PLACEHOLDER_M999"), "unknown"),
+            (None, None, "unknown"),
+        ];
+
+        for (name, model_enum, expected) in cases {
+            let blob = build_gen_metadata_with_model_and_enum(name, model_enum);
+            let mut seen = HashSet::new();
+            let msg = parse_gen_metadata_default(&blob, "s", 1_000, &HashMap::new(), &mut seen)
+                .expect("parses");
+            assert_eq!(
+                msg.model_id, expected,
+                "name: {name:?}, enum: {model_enum:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_enum_is_matched_by_key_not_by_position() {
+        let blob = build_gen_metadata_with_model_and_enum(
+            Some("gemini-3.8-flash"),
+            Some("MODEL_PLACEHOLDER_M318"),
+        );
+        let mut seen = HashSet::new();
+        let msg = parse_gen_metadata_default(&blob, "s", 1_000, &HashMap::new(), &mut seen)
+            .expect("parses");
+        assert_eq!(msg.model_id, "gemini-3.8-flash");
+
+        let blob_no_name =
+            build_gen_metadata_with_model_and_enum(None, Some("MODEL_PLACEHOLDER_M318"));
+        let mut seen2 = HashSet::new();
+        let msg2 =
+            parse_gen_metadata_default(&blob_no_name, "s", 1_000, &HashMap::new(), &mut seen2)
+                .expect("parses");
+        assert_eq!(msg2.model_id, "gemini-3.8-flash");
     }
 }
